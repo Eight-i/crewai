@@ -1,4 +1,3 @@
-# dependency_tools.py
 import os
 import pandas as pd
 import tomli as toml
@@ -8,19 +7,31 @@ import yaml
 import sys
 import importlib.util
 from crewai.tools import tool
+
 def is_builtin_module(module_name):
     return module_name in sys.builtin_module_names or importlib.util.find_spec(module_name) is None
 
 def split_dependency(dep):
-    match = re.match(r"([\w\-]+)(?:\[[^\]]+\])?([<>=~!]\s[\d\w\.\*]+)?(;.+)?", dep.strip())
+    dep = dep.strip()
+
+    # Remove environment markers (e.g., "; python_version < '3.11'")
+    if ";" in dep:
+        dep = dep.split(";", 1)[0].strip()
+
+    if "@" in dep:
+        package, version = map(str.strip, dep.split("@", 1))
+        return package, f"@ {version}"
+
+    match = re.match(r"([\w\-\.]+)(?:\[[^\]]+\])?\s*(==|>=|<=|>|<|~=)?\s*([\d\w\.\*]+)?", dep)
     if match:
         package = match.group(1)
-        version = (match.group(2) or "").strip()
-        condition = (match.group(3) or "").strip()
-        if condition:
-            version = f"{version} {condition}".strip()
-        return package, version if version else "Unknown"
-    return dep, "Unknown"
+        version_operator = match.group(2) or ""
+        version_number = match.group(3) or ""
+        version = f"{version_operator}{version_number}".strip() or "latest"
+        return package, version
+
+    return dep, "latest"
+
 
 def parse_setup_py(file_path):
     with open(file_path, 'r') as file:
@@ -40,10 +51,18 @@ def extract_pipfile_dependencies(pipfile_path):
     dependencies = []
     try:
         pipfile_data = toml.load(pipfile_path)
+
+        if "requires" in pipfile_data:
+            python_version = pipfile_data["requires"].get("python_version")
+            if python_version:
+                dependencies.append((pipfile_path, "python", python_version))
+
         for section in ["packages", "dev-packages"]:
             if section in pipfile_data:
                 for package, version in pipfile_data[section].items():
-                    package, version = split_dependency(f"{package}{version}")
+                    if isinstance(version, dict):
+                        version = version.get("version", "")
+                    package, version = split_dependency(f"{package} {version}")
                     dependencies.append((pipfile_path, package, version))
     except Exception as e:
         print(f"Error reading Pipfile {pipfile_path}: {e}")
@@ -51,22 +70,36 @@ def extract_pipfile_dependencies(pipfile_path):
 
 def extract_pyproject_dependencies(pyproject_path):
     dependencies = []
-    try:
-        pyproject_data = toml.load(pyproject_path)
-        if "tool" in pyproject_data and "poetry" in pyproject_data["tool"]:
-            poetry_data = pyproject_data["tool"]["poetry"]
-            for section in ["dependencies", "dev-dependencies"]:
-                if section in poetry_data:
-                    for package, version in poetry_data[section].items():
-                        package, version = split_dependency(f"{package}{version}")
-                        dependencies.append((pyproject_path, package, version))
-        elif "project" in pyproject_data and "dependencies" in pyproject_data["project"]:
-            for dep in pyproject_data["project"]["dependencies"]:
-                package, version = split_dependency(dep)
-                dependencies.append((pyproject_path, package, version))
-    except Exception as e:
-        print(f"Error reading pyproject.toml {pyproject_path}: {e}")
+
+    with open(pyproject_path, 'r', encoding='utf-8') as f:
+        pyproject_data = toml.load(f)
+
+    # ✅ Existing PEP 621 / Poetry standard checks
+    if "project" in pyproject_data and "dependencies" in pyproject_data["project"]:
+        for dep in pyproject_data["project"]["dependencies"]:
+            package, version = split_dependency(dep)
+            dependencies.append((pyproject_path, package, version))
+
+    elif "tool" in pyproject_data and "poetry" in pyproject_data["tool"]:
+        poetry_deps = pyproject_data["tool"]["poetry"].get("dependencies", {})
+        for package, detail in poetry_deps.items():
+            if isinstance(detail, str):
+                version = detail
+            elif isinstance(detail, dict):
+                version = detail.get("version", "unspecified")
+            else:
+                version = "unspecified"
+            dependencies.append((pyproject_path, package, version))
+
+    # ✅ ADD THIS fallback check here — your custom non-standard top-level dependencies
+    elif "dependencies" in pyproject_data and isinstance(pyproject_data["dependencies"], list):
+        for dep in pyproject_data["dependencies"]:
+            package, version = split_dependency(dep)
+            dependencies.append((pyproject_path, package, version))
+
     return dependencies
+
+
 
 def extract_poetry_lock_dependencies(poetry_lock_path):
     dependencies = []
@@ -75,7 +108,7 @@ def extract_poetry_lock_dependencies(poetry_lock_path):
             poetry_lock_data = toml.load(file)
         for package in poetry_lock_data.get("package", []):
             name = package.get("name", "")
-            version = package.get("version", "Unknown")
+            version = package.get("version", "latest")
             dependencies.append((poetry_lock_path, name, version))
     except Exception as e:
         print(f"Error reading poetry.lock {poetry_lock_path}: {e}")
@@ -86,6 +119,14 @@ def get_conda_dependencies(env_file):
     try:
         with open(env_file, "r") as f:
             env_data = yaml.safe_load(f)
+
+            python_version = env_data.get("dependencies", [])
+            if isinstance(python_version, list):
+                for item in python_version:
+                    if isinstance(item, str) and item.startswith("python"):
+                        _, version = split_dependency(item)
+                        dependencies.append((env_file, "python", version))
+
             for dep in env_data.get("dependencies", []):
                 if isinstance(dep, str):
                     package, version = split_dependency(dep)
@@ -105,8 +146,8 @@ def get_pip_dependencies(requirements_file):
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    package, *version = line.split("==")
-                    dependencies.append((requirements_file, package.strip(), version[0].strip() if version else "Unknown"))
+                    package, version = split_dependency(line)
+                    dependencies.append((requirements_file, package, version))
     except Exception as e:
         print(f"Error reading requirements.txt {requirements_file}: {e}")
     return dependencies
@@ -130,21 +171,23 @@ def extract_python_file_dependencies(project_path, python_version):
                     print(f"Error reading {file_path}: {e}")
     return list(dependencies)
 
-def find_file(root_path, filename):
+def find_all_files(root_path, filename):
+    matches = []
     for root, _, files in os.walk(root_path):
-        if filename in files:
-            return os.path.join(root, filename)
-    return None
+        for f in files:
+            if f.lower() == filename.lower():
+                matches.append(os.path.join(root, f))
 
-# 🧠 CREWAI TOOL FUNCTION
+    return matches
+
 @tool
 def extract_project_dependencies(project_path: str) -> str:
     """
     Extract dependencies from all common dependency files and source code within a Python project directory.
-    
+
     Args:
         project_path (str): The root path of the Python project.
-        
+
     Returns:
         str: Path to the generated CSV file containing all dependencies.
     """
@@ -160,16 +203,15 @@ def extract_project_dependencies(project_path: str) -> str:
     all_dependencies = []
 
     for filename, extractor in dependency_files.items():
-        file_path = find_file(project_path, filename)
-        if file_path:
+        file_paths = find_all_files(project_path, filename)
+        for file_path in file_paths:
             try:
                 all_dependencies.extend(extractor(file_path))
             except Exception as e:
-                print(f"Error extracting from {filename}: {e}")
+                print(f"Error extracting from {file_path}: {e}")
 
-    all_dependencies.extend(extract_python_file_dependencies(project_path, "Python"))
+    all_dependencies.extend(extract_python_file_dependencies(project_path, "latest"))
 
-    # Save to CSV
     csv_file = os.path.join(project_path, "all_dependencies_with_paths.csv")
     df = pd.DataFrame(all_dependencies, columns=["Source Path", "Package", "Version"])
     df.to_csv(csv_file, index=False)
